@@ -1,132 +1,84 @@
 import math
+from io import BytesIO
+
 import pandas as pd
+import pydeck as pdk
 import streamlit as st
 
 
-# ==========================
-# FUNGSI UTIL
-# ==========================
 def haversine_distance_km(lat1, lon1, lat2, lon2):
-    """
-    Hitung jarak antara dua titik (lat, lon) di permukaan bumi dalam kilometer.
-    Input dalam derajat.
-    """
-    # radius bumi dalam km
     R = 6371.0
-
-    # konversi ke radian
-    lat1_rad = math.radians(lat1)
-    lon1_rad = math.radians(lon1)
-    lat2_rad = math.radians(lat2)
-    lon2_rad = math.radians(lon2)
-
-    dlat = lat2_rad - lat1_rad
-    dlon = lon2_rad - lon1_rad
-
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
     a = (
         math.sin(dlat / 2) ** 2
-        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
+        + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
     )
-    c = 2 * math.asin(math.sqrt(a))
-
-    distance_km = R * c
-    return distance_km
+    return 2 * R * math.asin(math.sqrt(a))
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalisasi nama kolom agar sesuai format standar:
-
-      - shipment_code
-      - delivery_latitude
-      - delivery_longitude
-      - dropoff_latitude
-      - dropoff_longitude
-
-    Kalau nama di Excel beda (misal: delivery_lat, actual_lat, dll),
-    di-mapping di sini.
-    """
     df = df.copy()
     df.columns = [c.strip().lower() for c in df.columns]
 
     col_map = {
-        # shipment
         "shipment_code": "shipment_code",
         "shipment": "shipment_code",
-
-        # delivery lat
         "delivery_lat": "delivery_latitude",
         "delivery_latitude": "delivery_latitude",
         "delivery_latitude_deg": "delivery_latitude",
-
-        # delivery long
         "delivery_lng": "delivery_longitude",
         "delivery_long": "delivery_longitude",
         "delivery_longitude": "delivery_longitude",
-
-        # actual/dropoff lat
         "actual_lat": "dropoff_latitude",
         "actual_latitude": "dropoff_latitude",
         "actual_dropoff_lat": "dropoff_latitude",
         "dropoff_lat": "dropoff_latitude",
-
-        # actual/dropoff long
         "actual_lng": "dropoff_longitude",
         "actual_longitude": "dropoff_longitude",
         "actual_dropoff_long": "dropoff_longitude",
         "dropoff_lng": "dropoff_longitude",
         "dropoff_long": "dropoff_longitude",
+        "number_account": "number_account",
+        "no_account": "number_account",
+        "account": "number_account",
+        "customer_code": "number_account",
     }
 
-    renamed = {}
-    for col in df.columns:
-        if col in col_map:
-            renamed[col] = col_map[col]
+    df = df.rename(columns={c: col_map[c] for c in df.columns if c in col_map})
 
-    df = df.rename(columns=renamed)
-
-    required_cols = [
+    required = [
         "shipment_code",
         "delivery_latitude",
         "delivery_longitude",
         "dropoff_latitude",
         "dropoff_longitude",
     ]
-
-    missing = [c for c in required_cols if c not in df.columns]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(
-            "Kolom wajib belum lengkap.\n"
-            f"Harus ada: {required_cols}\n"
-            f"Kolom yang kurang: {missing}\n"
-            "Silakan sesuaikan nama kolom di Excel atau update mapping di normalize_columns()."
-        )
+        raise ValueError(f"Missing required columns: {missing}")
 
-    df = df[required_cols]
+    cols = required + (["number_account"] if "number_account" in df.columns else [])
+    df = df[cols]
 
-    # pastikan numeric
-    numeric_cols = [
-        "delivery_latitude",
-        "delivery_longitude",
-        "dropoff_latitude",
-        "dropoff_longitude",
-    ]
-    for c in numeric_cols:
+    for c in required[1:]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     return df
 
 
-def compute_distances(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Hitung jarak delivery vs dropoff per baris, hasilkan kolom:
-      - distance_km
-      - distance_meters
-    """
-    df = df.copy()
+def classify_account_type(number_account) -> str:
+    if pd.isna(number_account):
+        return "Corporate/Other"
+    s = str(number_account)
+    if s.startswith("EM.") or "@" in s:
+        return "Retail"
+    return "Corporate/Other"
 
-    # buang baris yang lat/long-nya null
-    df_valid = df.dropna(
+
+def compute_distances(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().dropna(
         subset=[
             "delivery_latitude",
             "delivery_longitude",
@@ -134,110 +86,280 @@ def compute_distances(df: pd.DataFrame) -> pd.DataFrame:
             "dropoff_longitude",
         ]
     )
+    df["distance_km"] = df.apply(
+        lambda r: haversine_distance_km(
+            r["delivery_latitude"],
+            r["delivery_longitude"],
+            r["dropoff_latitude"],
+            r["dropoff_longitude"],
+        ),
+        axis=1,
+    )
+    df["distance_meters"] = df["distance_km"] * 1000
+    return df
 
-    # hitung jarak per baris
-    def _calc_row(row):
-        return haversine_distance_km(
-            row["delivery_latitude"],
-            row["delivery_longitude"],
-            row["dropoff_latitude"],
-            row["dropoff_longitude"],
+
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    out = BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="results")
+    return out.getvalue()
+
+
+def build_map_deck(df: pd.DataFrame, show_delivery: bool, show_dropoff: bool, show_lines: bool):
+    if df.empty:
+        return None
+
+    layers = []
+
+    delivery_df = df.rename(
+        columns={"delivery_latitude": "lat", "delivery_longitude": "lon"}
+    )[["shipment_code", "lat", "lon", "distance_km"]].dropna()
+
+    dropoff_df = df.rename(
+        columns={"dropoff_latitude": "lat", "dropoff_longitude": "lon"}
+    )[["shipment_code", "lat", "lon", "distance_km"]].dropna()
+
+    lines_df = df[
+        [
+            "shipment_code",
+            "delivery_latitude",
+            "delivery_longitude",
+            "dropoff_latitude",
+            "dropoff_longitude",
+            "distance_km",
+        ]
+    ].dropna()
+    lines_df = lines_df.rename(
+        columns={
+            "delivery_latitude": "from_lat",
+            "delivery_longitude": "from_lon",
+            "dropoff_latitude": "to_lat",
+            "dropoff_longitude": "to_lon",
+        }
+    )
+
+    if delivery_df.empty and dropoff_df.empty and lines_df.empty:
+        return None
+
+    pts = []
+    if not delivery_df.empty:
+        pts.append(delivery_df[["lat", "lon"]])
+    if not dropoff_df.empty:
+        pts.append(dropoff_df[["lat", "lon"]])
+    all_points = pd.concat(pts, ignore_index=True)
+    center_lat, center_lon = all_points["lat"].mean(), all_points["lon"].mean()
+
+    view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=10, pitch=0)
+
+    if show_delivery and not delivery_df.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=delivery_df,
+                get_position="[lon, lat]",
+                get_radius=100,
+                get_fill_color=[0, 0, 255, 160],
+                pickable=True,
+                id="delivery",
+            )
         )
 
-    df_valid["distance_km"] = df_valid.apply(_calc_row, axis=1)
-    df_valid["distance_meters"] = df_valid["distance_km"] * 1000
+    if show_dropoff and not dropoff_df.empty:
+        layers.append(
+            pdk.Layer(
+                "ScatterplotLayer",
+                data=dropoff_df,
+                get_position="[lon, lat]",
+                get_radius=100,
+                get_fill_color=[255, 0, 0, 160],
+                pickable=True,
+                id="dropoff",
+            )
+        )
 
-    return df_valid
+    if show_lines and not lines_df.empty:
+        min_d, max_d = lines_df["distance_km"].min(), lines_df["distance_km"].max()
+        if max_d == min_d:
+            lines_df["dist_norm"] = 1.0
+        else:
+            lines_df["dist_norm"] = (lines_df["distance_km"] - min_d) / (max_d - min_d)
+
+        def color_from_norm(n):
+            n = max(0.0, min(1.0, float(n)))
+            r = int(100 + n * 155)
+            g = int(200 - n * 150)
+            return [r, g, 0, 200]
+
+        lines_df["color"] = lines_df["dist_norm"].apply(color_from_norm)
+
+        layers.append(
+            pdk.Layer(
+                "LineLayer",
+                data=lines_df,
+                get_source_position="[from_lon, from_lat]",
+                get_target_position="[to_lon, to_lat]",
+                get_width=2,
+                get_color="color",
+                pickable=True,
+                id="lines",
+            )
+        )
+
+    if not layers:
+        return None
+
+    return pdk.Deck(
+        map_style="mapbox://styles/mapbox/light-v9",
+        initial_view_state=view_state,
+        layers=layers,
+        tooltip={
+            "html": "<b>Shipment:</b> {shipment_code}<br/><b>Distance (km):</b> {distance_km}",
+            "style": {"backgroundColor": "steelblue", "color": "white"},
+        },
+    )
 
 
-# ==========================
-# STREAMLIT APP
-# ==========================
 def main():
-    st.set_page_config(
-        page_title="Validasi Titik Delivery vs Actual Dropoff (Excel-only)",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Delivery vs Dropoff Distance Validation", layout="wide")
+    st.title("Delivery vs Actual Dropoff Distance Validation")
 
-    st.title("Validasi Titik Delivery vs Actual Dropoff (Excel-only)")
-    st.markdown(
-        """
-        Aplikasi ini:
-        1. Menerima upload file Excel berisi:
-           - `shipment_code`
-           - koordinat delivery (lat/long)
-           - koordinat actual/dropoff (lat/long)
-        2. Menghitung jarak antar titik di **Python** (tanpa BigQuery).
-        3. Menampilkan shipment yang jaraknya **di atas threshold** (default 1 km).
-        """
-    )
-
-    st.sidebar.header("Pengaturan Jarak")
+    st.sidebar.header("Distance Filter")
     min_km = st.sidebar.number_input(
-        "Minimal jarak (km) untuk ditampilkan",
-        min_value=0.1,
-        max_value=100.0,
-        value=1.0,
-        step=0.1,
+        "Minimum distance to show (km)", min_value=0.1, max_value=100.0, value=1.0, step=0.1
     )
+
+    st.sidebar.header("Map Layers")
+    show_delivery = st.sidebar.checkbox("Show Delivery Points", value=True)
+    show_dropoff = st.sidebar.checkbox("Show Dropoff Points", value=True)
+    show_lines = st.sidebar.checkbox("Show Lines (Delivery → Dropoff)", value=True)
 
     uploaded_file = st.file_uploader(
-        "Upload file Excel berisi data delivery vs dropoff",
+        "Upload Excel (shipment_code + delivery lat/long + dropoff lat/long + optional number_account)",
         type=["xlsx", "xls"],
-        accept_multiple_files=False,
     )
-
-    if uploaded_file is None:
-        st.info("Silakan upload file Excel di atas untuk mulai pengecekan.")
+    if not uploaded_file:
+        st.info("Please upload an Excel file to begin.")
         return
 
-    # Baca Excel
-    st.subheader("Preview Data Excel")
     try:
         df_raw = pd.read_excel(uploaded_file)
     except Exception as e:
-        st.error(f"Gagal membaca file Excel: {e}")
+        st.error(f"Error reading Excel: {e}")
         return
 
-    st.write("Beberapa baris pertama dari file yang di-upload:")
-    st.dataframe(df_raw.head())
-
-    # Normalisasi kolom
     try:
         df_norm = normalize_columns(df_raw)
-    except ValueError as e:
+    except Exception as e:
         st.error(str(e))
         return
 
-    st.write("Data setelah normalisasi kolom:")
-    st.dataframe(df_norm.head())
+    if "number_account" in df_norm.columns:
+        df_norm["account_type"] = df_norm["number_account"].apply(classify_account_type)
+    else:
+        df_norm["account_type"] = "Corporate/Other"
 
-    # Hitung jarak
-    with st.spinner("Menghitung jarak delivery vs dropoff..."):
-        df_with_dist = compute_distances(df_norm)
+    st.sidebar.header("Account Filter")
+    account_filter = st.sidebar.selectbox(
+        "Filter by account type", ["All", "Retail", "Corporate/Other"], index=0
+    )
 
-    st.success("Perhitungan jarak selesai.")
+    with st.spinner("Computing distances..."):
+        df_dist = compute_distances(df_norm)
 
-    # Filter jarak > threshold
-    df_result = df_with_dist[df_with_dist["distance_km"] > min_km].copy()
-    df_result = df_result.sort_values("distance_km", ascending=False)
+    mask_dist = df_dist["distance_km"] > min_km
+    if account_filter == "Retail":
+        mask_acc = df_dist["account_type"] == "Retail"
+    elif account_filter == "Corporate/Other":
+        mask_acc = df_dist["account_type"] == "Corporate/Other"
+    else:
+        mask_acc = True
 
-    st.subheader(f"Hasil: Shipment dengan jarak > {min_km:.2f} km")
-    st.write(f"Total baris: {len(df_result):,}")
+    df_result = df_dist[mask_dist & mask_acc].sort_values("distance_km", ascending=False)
 
-    if not df_result.empty:
+    tab_summary, tab_table, tab_map = st.tabs(["Summary", "Table", "Map"])
+
+    with tab_summary:
+        st.subheader("Summary")
+        total_rows, filtered_rows = len(df_dist), len(df_result)
+        max_d = df_result["distance_km"].max() if filtered_rows else 0
+        avg_d = df_result["distance_km"].mean() if filtered_rows else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Total valid rows", f"{total_rows:,}")
+        c2.metric("Rows > threshold (after account filter)", f"{filtered_rows:,}")
+        c3.metric("Max distance (km)", f"{max_d:.2f}")
+        c4.metric("Average distance (km)", f"{avg_d:.2f}")
+
+        st.markdown("#### Distance distribution (after filters)")
+        if filtered_rows:
+            st.dataframe(df_result["distance_km"].describe().to_frame("distance_km_stats"))
+        else:
+            st.info("No rows after filters.")
+
+        st.markdown("#### Account type distribution (before distance filter)")
+        st.dataframe(df_norm["account_type"].value_counts().to_frame("count"))
+
+    with tab_table:
+        st.subheader(
+            f"Rows where distance > {min_km:.2f} km"
+            + ("" if account_filter == "All" else f" and account_type = {account_filter}")
+        )
+        st.write(f"Total: **{len(df_result):,} rows**")
         st.dataframe(df_result)
 
-        # Download button
-        csv = df_result.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="Download hasil (CSV)",
-            data=csv,
-            file_name="hasil_validasi_jarak_excel_only.csv",
-            mime="text/csv",
+        if len(df_result) > 0:
+            excel_all = to_excel_bytes(df_result)
+            st.download_button(
+                "📥 Download Results (Excel - All Columns)",
+                excel_all,
+                file_name="delivery_vs_dropoff_validation_all_cols.xlsx",
+                mime=(
+                    "application/vnd.openxmlformats-officedocument."
+                    "spreadsheetml.sheet"
+                ),
+            )
+
+            ops_cols = [
+                "shipment_code",
+                "number_account",
+                "account_type",
+                "distance_km",
+                "distance_meters",
+                "delivery_latitude",
+                "delivery_longitude",
+                "dropoff_latitude",
+                "dropoff_longitude",
+            ]
+            ops_cols = [c for c in ops_cols if c in df_result.columns]
+            if ops_cols:
+                df_ops = df_result[ops_cols].copy()
+                excel_ops = to_excel_bytes(df_ops)
+                st.download_button(
+                    "📥 Download Results for Ops (Excel - Key Columns)",
+                    excel_ops,
+                    file_name="delivery_vs_dropoff_validation_ops.xlsx",
+                    mime=(
+                        "application/vnd.openxmlformats-officedocument."
+                        "spreadsheetml.sheet"
+                    ),
+                )
+
+    with tab_map:
+        st.subheader("Map Visualization (Delivery → Dropoff)")
+        st.markdown(
+            "- **Blue dots** = Delivery points  \n"
+            "- **Red dots** = Actual Dropoff points  \n"
+            "- **Lines** = Delivery → Dropoff (color intensity by distance)"
         )
-    else:
-        st.info("Tidak ada shipment yang melebihi threshold jarak yang ditentukan.")
+        if len(df_result) == 0:
+            st.info("No data to show on the map (no rows after filters).")
+        else:
+            deck = build_map_deck(df_result, show_delivery, show_dropoff, show_lines)
+            if deck is None:
+                st.info("No valid coordinates or all layers disabled.")
+            else:
+                st.pydeck_chart(deck)
 
 
 if __name__ == "__main__":
