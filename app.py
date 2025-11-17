@@ -323,13 +323,7 @@ def main():
             ops_cols = [
                 "shipment_code",
                 "number_account",
-                "account_type",
-                "distance_km",
                 "distance_meters",
-                "delivery_latitude",
-                "delivery_longitude",
-                "dropoff_latitude",
-                "dropoff_longitude",
             ]
             ops_cols = [c for c in ops_cols if c in df_result.columns]
             if ops_cols:
